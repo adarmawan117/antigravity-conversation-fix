@@ -61,6 +61,13 @@ import webbrowser
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import urlopen, Request
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _CURRENT_VERSION = "1.07"
 _GITHUB_REPO = "FutureisinPast/antigravity-conversation-fix"
 _RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
@@ -329,15 +336,17 @@ def _iter_brain_paths(conversation_id):
             yield path
 
 
-def _collect_all_conversations():
+def _collect_all_conversations(conv_dirs=None):
     """
-    Merge conversation files from all folders (new, old, backup).
+    Merge conversation files from specified folders (default: new, old, backup).
     Supports both .pb (protobuf, legacy) and .db (SQLite, v2.x+) formats.
     Deduplicates by conversation ID — first seen wins (priority: new > old > backup).
     Returns dict: {conversation_id: full_file_path}
     """
+    if conv_dirs is None:
+        conv_dirs = _ALL_CONV_DIRS
     catalog = {}
-    for conv_dir in _ALL_CONV_DIRS:
+    for conv_dir in conv_dirs:
         if not os.path.isdir(conv_dir):
             continue
         try:
@@ -1580,9 +1589,40 @@ def main():
         print("  Make sure Antigravity has been installed and opened at least once.")
         return 1
 
+    # ── Folder scope selection ──────────────────────────────────────────
+    target_conv_dirs = _ALL_CONV_DIRS
+    target_db_paths = DB_PATHS
+
+    existing_conv_dirs = [d for d in _ALL_CONV_DIRS if os.path.isdir(d)]
+    ide_conv_candidates = [
+        d for d in existing_conv_dirs
+        if os.path.basename(os.path.dirname(d)).lower() == "antigravity-ide"
+    ]
+
+    if ide_conv_candidates and len(existing_conv_dirs) > 1:
+        print("  Pilih cakupan percakapan yang ingin di-restore:")
+        print("    [1] Hanya Antigravity IDE (antigravity-ide) [Direkomendasikan]")
+        print("    [2] Semua folder (antigravity-ide + versi lama + backup)")
+        print()
+        try:
+            scope_choice = input("  Pilihan (tekan Enter untuk 1): ").strip()
+        except (EOFError, OSError):
+            scope_choice = "1"
+
+        if scope_choice in ("", "1"):
+            target_conv_dirs = ide_conv_candidates
+            ide_dbs = [p for p in DB_PATHS if "antigravity ide" in p.lower()]
+            if ide_dbs:
+                target_db_paths = ide_dbs
+            print("  -> Membatasi restore hanya untuk folder Antigravity IDE.")
+            print()
+        else:
+            print("  -> Memindai semua folder data.")
+            print()
+
     # ── Discover conversations (multi-folder merge with dedup) ───────────
 
-    conv_catalog = _collect_all_conversations()
+    conv_catalog = _collect_all_conversations(target_conv_dirs)
 
     if not conv_catalog:
         print("  No conversations found on disk. Nothing to fix.")
@@ -1603,16 +1643,16 @@ def main():
     for d, c in dir_counts.items():
         folder_name = os.path.basename(os.path.dirname(d))  # antigravity-ide, antigravity, etc.
         print(f"    {folder_name}: {c} conversation(s)")
-    print(f"  Found {len(conversation_ids)} unique conversations across all folders")
+    print(f"  Found {len(conversation_ids)} unique conversations across selected folder(s)")
     print()
 
     # ── Preserve existing metadata ──────────────────────────────────────────
 
     print("  Reading existing metadata from database(s)...")
-    for db_path in DB_PATHS:
+    for db_path in target_db_paths:
         app_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path))))
         print(f"    {app_name}: {db_path}")
-    existing_titles, existing_inner_blobs = extract_existing_metadata_from_paths(DB_PATHS)
+    existing_titles, existing_inner_blobs = extract_existing_metadata_from_paths(target_db_paths)
     ws_count = sum(1 for v in existing_inner_blobs.values()
                    if extract_workspace_hint(v))
     print(f"  Found {len(existing_titles)} existing titles to preserve")
@@ -1622,7 +1662,7 @@ def main():
     # ── Scan conversations ──────────────────────────────────────────────────
 
     print("  Scanning conversations (newest first):")
-    print("  " + "-" * 58)
+    print("  " + "-" * 105)
 
     resolved = []  # (cid, title, source, inner_data, has_ws)
     stats = {"brain": 0, "preserved": 0, "conversation": 0, "fallback": 0}
@@ -1636,9 +1676,9 @@ def main():
         stats[source] += 1
         marker = markers[source]
         ws_flag = " [WS]" if has_ws else ""
-        print(f"    [{i:3d}] {marker} {title[:50]}{ws_flag}")
+        print(f"    [{i:3d}] {marker}  {cid}  {title[:45]}{ws_flag}")
 
-    print("  " + "-" * 58)
+    print("  " + "-" * 105)
     print("  Legend: [+] brain  [~] preserved  [=] conversation  [?] fallback  [WS] workspace")
     print(
         f"  Totals: {stats['brain']} brain, {stats['preserved']} preserved, "
@@ -1741,7 +1781,7 @@ def main():
 
     print("  Writing rebuilt index to database(s):")
     saved_backups = []
-    for db_path in DB_PATHS:
+    for db_path in target_db_paths:
         app_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path))))
         suffix = re.sub(r"[^A-Za-z0-9]+", "_", app_name).strip("_").lower()
         backup_path = write_index_to_database(db_path, encoded, suffix)

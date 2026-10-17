@@ -20,3 +20,13 @@ env/
 .idea/
 .vscode/
 *.code-workspace
+
+# Local documentation & discussions
+.docs/
+
+# Temporary backups & state artifacts
+*backup*.txt
+trajectorySummaries_backup_*.txt
+
+# Windows shortcuts
+*.lnk
