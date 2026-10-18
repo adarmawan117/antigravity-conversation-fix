@@ -255,6 +255,121 @@ def remove_entry_by_cid(protobuf_bytes, target_cid):
     return cleaned
 
 
+def clean_workspace_path(p):
+    """
+    Normalisasi string workspace path agar bersih dari format file:/// 
+    dan bebas dari karakter binary/URL-encoded.
+    """
+    if not p:
+        return ""
+    p_unq = unquote(str(p))
+    m_file = re.search(r'file:/*([a-zA-Z]:/[^\r\n\t\x00-\x1f\x7f-\xff\"\'\<\>]+)', p_unq)
+    if m_file:
+        return os.path.normpath(m_file.group(1).rstrip('/\\'))
+    m_direct = re.search(r'([a-zA-Z]:[\\/][^\r\n\t\x00-\x1f\x7f-\xff\"\'\<\>]+)', p_unq)
+    if m_direct:
+        return os.path.normpath(m_direct.group(1).rstrip('/\\'))
+    if rc._SYSTEM != "Windows":
+        m_unix = re.search(r'file:/*(/[^\r\n\t\x00-\x1f\x7f-\xff\"\'\<\>]+)', p_unq)
+        if m_unix:
+            return os.path.normpath(m_unix.group(1).rstrip('/\\'))
+        if p_unq.startswith('/'):
+            return os.path.normpath(p_unq.strip())
+    if "vscode-remote://" in p_unq:
+        m_remote = re.search(r'(vscode-remote://[^\r\n\t\x00-\x1f\x7f-\xff\"\'\<\>]+)', p_unq)
+        if m_remote:
+            return m_remote.group(1)
+    return p_unq.strip()
+
+
+def resolve_conversation_workspace(cid, existing_inner_blobs, known_ws_uris, known_paths, brain_dir, conv_dir):
+    """
+    Mendeteksi workspace / project path dari berbagai sumber secara bertingkat:
+    1. Inner blob di state.vscdb
+    2. Heuristik brain .md via rc.infer_workspace_from_brain
+    3. Brain log files (.system_generated/logs: overview.txt, transcript.jsonl)
+    4. Brain user files (.md, .txt, .json)
+    5. Langkah conversation database (.db)
+    """
+    # 1. Dari blob state.vscdb
+    blob = existing_inner_blobs.get(cid)
+    if blob:
+        hint = rc.extract_workspace_hint(blob)
+        if hint:
+            cw = clean_workspace_path(hint)
+            if cw:
+                return cw
+
+    # 2. Heuristik infer dari brain via rebuild_conversations
+    inferred = rc.infer_workspace_from_brain(cid, known_ws_uris)
+    if inferred:
+        cw = clean_workspace_path(inferred)
+        if cw:
+            return cw
+
+    # 3. Cek log brain (overview.txt / transcript.jsonl)
+    b_path = os.path.join(brain_dir, cid, '.system_generated', 'logs')
+    for log_name in ['overview.txt', 'transcript.jsonl']:
+        fpath = os.path.join(b_path, log_name)
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    for idx, line in enumerate(f):
+                        if idx > 150:
+                            break
+                        # Pola [URI] -> [CorpusName]
+                        m = re.search(r'\[([^\]]+)\]\s*->\s*\[[^\]]+\]', line)
+                        if m:
+                            cand = clean_workspace_path(m.group(1).strip())
+                            if cand and len(cand) > 3:
+                                return cand
+                        # Pola Active Document: d:\ADR\...
+                        m_doc = re.search(r'Active Document:\s*([a-zA-Z]:\\[^\r\n\(]+)', line)
+                        if m_doc:
+                            doc_p = os.path.normpath(m_doc.group(1).strip()).replace('\\', '/')
+                            for kp in known_paths:
+                                if doc_p.lower().startswith(kp.lower()):
+                                    return os.path.normpath(kp)
+            except Exception:
+                pass
+
+    # 4. Cek file-file brain (notes, summaries, scratch)
+    b_root = os.path.join(brain_dir, cid)
+    if os.path.isdir(b_root):
+        for root, dirs, files in os.walk(b_root):
+            for fname in files:
+                if fname.endswith(('.md', '.txt', '.json')):
+                    try:
+                        with open(os.path.join(root, fname), 'r', encoding='utf-8', errors='replace') as f:
+                            text = f.read(32768)
+                            for kp in known_paths:
+                                if kp.lower() in text.lower().replace('\\', '/'):
+                                    return os.path.normpath(kp)
+                    except Exception:
+                        pass
+
+    # 5. Cek steps payload pada file .db
+    if conv_dir:
+        db_file = os.path.join(conv_dir, f"{cid}.db")
+        if os.path.exists(db_file):
+            try:
+                conn = sqlite3.connect(db_file)
+                cur = conn.cursor()
+                cur.execute("SELECT step_payload FROM steps LIMIT 10")
+                for r in cur.fetchall():
+                    if r[0]:
+                        text = str(r[0])
+                        for kp in known_paths:
+                            if kp.lower() in text.lower().replace('\\', '/'):
+                                conn.close()
+                                return os.path.normpath(kp)
+                conn.close()
+            except Exception:
+                pass
+
+    return None
+
+
 def parse_selection(raw, display_list):
     """
     Mem-parsing input pengguna menjadi daftar item yang dipilih dari display_list.
@@ -446,6 +561,14 @@ def main():
     existing_titles, existing_inner_blobs = rc.extract_existing_metadata_from_paths(db_paths)
     known_ws_uris = rc.load_known_workspace_uris()
 
+    known_paths = []
+    for u in known_ws_uris:
+        p = rc._uri_to_local_path(u)
+        if p:
+            p = os.path.normpath(p).replace("\\", "/")
+            known_paths.append(p)
+    known_paths.sort(key=len, reverse=True)
+
     markers = {"brain": "+", "preserved": "~", "conversation": "=", "fallback": "?"}
 
     print()
@@ -460,11 +583,15 @@ def main():
         status = "[OK]  " if cid in indexed_ids else "[HILANG]"
         title, source = rc.resolve_title(cid, existing_titles, fpath)
         marker = markers.get(source, "?")
+        ws_path = resolve_conversation_workspace(
+            cid, existing_inner_blobs, known_ws_uris, known_paths, brain_dir, conv_dir
+        )
 
         max_title_len = 45
         short_title = title[:max_title_len] + "..." if len(title) > max_title_len else title
         print(f"  {i:>4}  {status} [{marker}]  {date_str}  {cid}  {short_title}")
-        display_list.append((cid, fpath, mtime, title, source))
+        print(" " * 32 + f"Path:  {ws_path or '-'}\n")
+        display_list.append((cid, fpath, mtime, title, source, ws_path))
 
     print("  " + "-" * 115)
     print("  Status: [OK] = sudah ada di sidebar  |  [HILANG] = belum masuk index")
@@ -483,13 +610,14 @@ def main():
         break
 
     if len(chosen_items) == 1:
-        chosen_cid, chosen_path, chosen_mtime, chosen_title, chosen_source = chosen_items[0]
+        chosen_cid, chosen_path, chosen_mtime, chosen_title, chosen_source, chosen_ws = chosen_items[0]
         print()
         print("  Percakapan dipilih:")
-        print(f"    ID     : {chosen_cid}")
-        print(f"    Judul  : {chosen_title}")
-        print(f"    Sumber : {chosen_source}")
-        print(f"    File   : {chosen_path}")
+        print(f"    ID           : {chosen_cid}")
+        print(f"    Judul        : {chosen_title}")
+        print(f"    Project Path : {chosen_ws or '-'}")
+        print(f"    Sumber       : {chosen_source}")
+        print(f"    File         : {chosen_path}")
         print()
 
         if chosen_cid in indexed_ids:
@@ -502,10 +630,11 @@ def main():
     else:
         print()
         print(f"  Percakapan dipilih ({len(chosen_items)} percakapan):")
-        for idx, (cid, path, mtime, title, source) in enumerate(chosen_items, 1):
+        for idx, (cid, path, mtime, title, source, ws) in enumerate(chosen_items, 1):
             status_tag = "[OK]  " if cid in indexed_ids else "[HILANG]"
             short = title[:50] + "..." if len(title) > 50 else title
             print(f"    {idx:>2}. {status_tag} {cid} - {short}")
+            print(" " * 8 + f"Path:  {ws or '-'}")
         print()
 
         already_indexed = [item for item in chosen_items if item[0] in indexed_ids]
@@ -524,15 +653,11 @@ def main():
     all_new_entries_bytes = b""
     chosen_cids = [item[0] for item in sorted_items]
 
-    for cid, fpath, mtime, title, source in sorted_items:
+    for cid, fpath, mtime, title, source, ws_path in sorted_items:
         inner_data = existing_inner_blobs.get(cid)
-        ws_path = None
-        inferred = rc.infer_workspace_from_brain(cid, known_ws_uris)
-        if inferred and (rc._is_remote_uri(inferred) or os.path.isdir(inferred)):
-            ws_path = inferred
-            if len(sorted_items) == 1:
-                display_ws = os.path.basename(ws_path) if not rc._is_remote_uri(ws_path) else ws_path
-                print(f"  Workspace terdeteksi: {display_ws}")
+        if ws_path and len(sorted_items) == 1:
+            display_ws = os.path.basename(ws_path) if not rc._is_remote_uri(ws_path) else ws_path
+            print(f"  Workspace terdeteksi: {display_ws} ({ws_path})")
 
         source_is_db = bool(fpath and fpath.lower().endswith(".db"))
 
